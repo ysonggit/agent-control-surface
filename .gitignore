@@ -1,0 +1,4 @@
+firmware/lib/
+firmware/build/
+.run/
+__pycache__/

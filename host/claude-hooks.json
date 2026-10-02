@@ -1,0 +1,13 @@
+{
+  "hooks": {
+    "PermissionRequest": [ { "matcher": "*", "hooks": [ { "type": "command", "command": "python3 ~/Github/agent-control-surface/host/acs_hook.py --agent claude", "timeout": 300 } ] } ],
+    "SessionStart":      [ { "hooks": [ { "type": "command", "command": "python3 ~/Github/agent-control-surface/host/acs_hook.py --agent claude", "timeout": 2 } ] } ],
+    "SessionEnd":        [ { "hooks": [ { "type": "command", "command": "python3 ~/Github/agent-control-surface/host/acs_hook.py --agent claude", "timeout": 2 } ] } ],
+    "UserPromptSubmit":  [ { "hooks": [ { "type": "command", "command": "python3 ~/Github/agent-control-surface/host/acs_hook.py --agent claude", "timeout": 2 } ] } ],
+    "PreToolUse":        [ { "matcher": "*", "hooks": [ { "type": "command", "command": "python3 ~/Github/agent-control-surface/host/acs_hook.py --agent claude", "timeout": 2 } ] } ],
+    "PostToolUse":       [ { "matcher": "*", "hooks": [ { "type": "command", "command": "python3 ~/Github/agent-control-surface/host/acs_hook.py --agent claude", "timeout": 2 } ] } ],
+    "Notification":      [ { "matcher": "*", "hooks": [ { "type": "command", "command": "python3 ~/Github/agent-control-surface/host/acs_hook.py --agent claude", "timeout": 2 } ] } ],
+    "Stop":              [ { "hooks": [ { "type": "command", "command": "python3 ~/Github/agent-control-surface/host/acs_hook.py --agent claude", "timeout": 2 } ] } ],
+    "StopFailure":       [ { "hooks": [ { "type": "command", "command": "python3 ~/Github/agent-control-surface/host/acs_hook.py --agent claude", "timeout": 2 } ] } ]
+  }
+}
