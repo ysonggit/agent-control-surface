@@ -6,7 +6,7 @@ A small USB device next to the keyboard that shows coding-agent status and lets 
 - `host/acs_hook.py` — the hook Claude Code runs. Exits instantly with no output when the daemon or device is absent.
 - `host/claude-hooks.json` — hook config to merge into `~/.claude/settings.json` (or a project's `.claude/settings.json`).
 - `sim/device_sim.py` — terminal stand-in for the device.
-- `firmware/` — device firmware (pending: board confirmation and toolchain).
+- `firmware/` — device firmware for a Seeed XIAO nRF52840 Plus with a 1.47" touch display. `firmware/build.sh` builds it (`firmware/build.sh upload` also flashes it); needs `arduino-cli` with the Seeed nRF52 core and ArduinoJson.
 
 ## Daemon at login
 
