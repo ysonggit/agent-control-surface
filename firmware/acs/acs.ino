@@ -1,28 +1,19 @@
-// Agent Control Surface firmware — XIAO nRF52840 Plus + 1.47" JD9853A/AXS5106L touch display.
-// Renders host snapshots and emits decisions over USB CDC. Protocol: docs/PROTOCOL.md.
-// Display/touch bring-up follows Seeed_GFX2's "1.47 inch Touch Display/nRF52840 Plus/Touch" example.
-
-#include <Seeed_GFX.h>
-#include "board/boards/XIAO_LCD_Board.h"
-#include "driver/tft/Driver_JD9853A.h"
-#include "panel/Panel_TFT.h"
-#include "touch/Touch_AXS5106L.h"
+// Agent Control Surface firmware — renders host snapshots and emits decisions over USB CDC. Protocol: docs/PROTOCOL.md.
+// Boards: board_xiao_nrf.h (Seeed XIAO nRF52840 + 1.47" LCD) and board_amoled164.h (Waveshare ESP32-S3 1.64" AMOLED),
+// chosen by the chip the sketch is built for.
+#if defined(ARDUINO_ARCH_ESP32)
+#include "board_amoled164.h"
+#else
+#include "board_xiao_nrf.h"
+#endif
 #include <ArduinoJson.h>
-#include <nrf.h>
-#include <nrf_gpio.h>
 #include "icons.h"
 #include "cat.h"
+#if RAIL_LARGE_ICONS
+#include "icons_l.h"
+#endif
 typedef const char (*CatSprite)[CAT_W + 1];   // one cat pose (see cat.h)
-#include <font/GFXFF/FreeSansBold12pt7b.h>
-#include <font/GFXFF/FreeSansBold9pt7b.h>
-#include <font/GFXFF/FreeSans9pt7b.h>
 
-static constexpr int8_t LCD_RST_PIN = 38;
-static constexpr int8_t LCD_BL_PIN = 37;
-static constexpr uint8_t USR1_PIN = D19;   // hold: allow
-static constexpr uint8_t USR2_PIN = D15;   // short: deny; hold: deny + stop
-
-static constexpr int W = 172, H = 320;
 static constexpr uint32_t ALLOW_HOLD_MS = 800, STOP_HOLD_MS = 1500, HOST_TIMEOUT_MS = 12000;
 
 // Palette (RGB565)
@@ -33,8 +24,6 @@ static constexpr uint16_t C_CLAUDE = 0xDBAE;   // Claude brand orange #D97757
 static constexpr uint16_t C_BUSY = 0x2E9F, C_NEED = 0xFD20, C_DONE = 0x3666, C_ERR = 0xF8A3;
 static constexpr uint16_t C_ALLOW = 0x2C84, C_DENY = 0xB0A2, C_HOLD = 0x5FEC;
 
-Seeed_GFX display;
-Touch_AXS5106L touch(-1, D7, Wire, W, H);   // RST shared with LCD, handled by display.begin
 
 // ── state from the latest snapshot ──────────────────────────────────────────
 struct Session { char agent[8]; char label[20]; char st[12]; char tool[16]; char target[44]; };
@@ -80,8 +69,6 @@ uint32_t detailSince = 0;
 // Backlight, sleep, battery
 static constexpr uint8_t BL_LEVELS[] = {255, 150, 70};
 static constexpr uint32_t SLEEP_AFTER_MS = 90000;
-static constexpr uint8_t READ_BAT_P0_PIN = 14, CHG_P0_PIN = 17;
-static constexpr float BAT_DIVIDER = (1000.0f + 499.0f) / 499.0f;
 uint8_t blIndex = 0;
 bool asleep = false;
 uint32_t lastActivity = 0;
@@ -99,13 +86,13 @@ bool dirty = true;
 static char line[2100];
 static size_t lineLen = 0;
 
-void sendHello() { Serial.println(F("{\"t\":\"hello\",\"fw\":\"0.7.0\",\"w\":172,\"h\":320}")); }
+void sendHello() { Serial.printf(("{\"t\":\"hello\",\"fw\":\"0.9.0\",\"board\":\"" BOARD_NAME "\",\"w\":%d,\"h\":%d}\n"), W, H); }
 
 void wake() {
   lastActivity = millis();
   if (asleep) {
     asleep = false;
-    analogWrite(LCD_BL_PIN, BL_LEVELS[blIndex]);
+    setBacklight(BL_LEVELS[blIndex]);
   }
 }
 
@@ -383,7 +370,7 @@ uint16_t ringColor(const char *agent, int used) {
 }
 
 // ── Pulse-style ring, rendered off-screen and pushed as one image ────────────
-static constexpr int MAX_D = 112;
+static constexpr int MAX_D = RAIL_LARGE_ICONS ? RAIL_D : 112;
 static uint16_t tile[MAX_D * MAX_D];
 
 static inline uint16_t blend(uint16_t fg, uint16_t bg, float a) {
@@ -398,14 +385,15 @@ static inline uint16_t blend(uint16_t fg, uint16_t bg, float a) {
 static inline float clamp01(float v) { return v < 0 ? 0 : v > 1 ? 1 : v; }
 
 // used < 0: no reading (track only). orbitDeg < 0: no activity dot. letter: mark for agents without an icon.
-void drawRing(int x0, int y0, int D, int used, uint16_t arc, uint16_t track, const uint8_t *icon, float orbitDeg) {
-  const float c = (D - 1) / 2.0f, rOut = D / 2.0f - 1, th = D >= 90 ? 9.0f : 7.0f;
+void drawRing(int x0, int y0, int D, int used, uint16_t arc, uint16_t track, const uint8_t *icon, float orbitDeg,
+              int iconSize = ICON_SIZE) {
+  const float c = (D - 1) / 2.0f, rOut = D / 2.0f - 1, th = D >= 120 ? 12.0f : D >= 90 ? 9.0f : 7.0f;
   const float rIn = rOut - th, rMid = (rOut + rIn) / 2, capR = th / 2;
   const float sweep = used <= 0 ? 0 : max(6.0f, min(used, 100) * 3.6f);
   const float s0x = c, s0y = c - rMid;
   const float s1x = c + rMid * sinf(sweep * DEG_TO_RAD), s1y = c - rMid * cosf(sweep * DEG_TO_RAD);
   const float ox = c + rMid * sinf(orbitDeg * DEG_TO_RAD), oy = c - rMid * cosf(orbitDeg * DEG_TO_RAD);
-  const int io = (D - ICON_SIZE) / 2;
+  const int io = (D - iconSize) / 2;
   for (int y = 0; y < D; y++) {
     for (int x = 0; x < D; x++) {
       const float dx = x - c, dy = y - c, d = sqrtf(dx * dx + dy * dy);
@@ -425,8 +413,8 @@ void drawRing(int x0, int y0, int D, int used, uint16_t arc, uint16_t track, con
         float e = sqrtf((x - ox) * (x - ox) + (y - oy) * (y - oy));
         px = blend(C_FG, px, clamp01(capR + 1.0f - e + 0.5f));
       }
-      if (icon && x >= io && x < io + ICON_SIZE && y >= io && y < io + ICON_SIZE) {
-        uint8_t a = icon[(y - io) * ICON_SIZE + (x - io)];
+      if (icon && x >= io && x < io + iconSize && y >= io && y < io + iconSize) {
+        uint8_t a = icon[(y - io) * iconSize + (x - io)];
         if (a) px = blend(C_FG, px, a / 255.0f);
       }
       tile[y * D + x] = px;
@@ -435,14 +423,22 @@ void drawRing(int x0, int y0, int D, int used, uint16_t arc, uint16_t track, con
   display.pushImage(x0, y0, D, D, (const uint16_t *)tile);
 }
 
-void drawAgentRing(int i, int x0, int y0, int D, float orbitDeg) {
+void drawAgentRing(int i, int x0, int y0, int D, float orbitDeg, bool large = false) {
   const Usage *u = agentUsage(agents[i]);
   int used = u && u->avail ? u->win[0].used : -1;
   const Session *s = topSession(agents[i]);
   uint16_t track = s && !strcmp(s->st, "needs_you") ? 0x6200 : C_TRACK;   // dim amber track when it needs you
   bool attn = s && (!strcmp(s->st, "done") || !strcmp(s->st, "needs_you"));
   if (attn && unseen() && pulseOn) track = !strcmp(s->st, "done") ? C_OK : C_NEED;   // pulsing "your turn"
-  drawRing(x0, y0, D, used, used < 0 ? C_TRACK : ringColor(agents[i], used), track, agentIcon(agents[i]), orbitDeg);
+  const uint8_t *icon = agentIcon(agents[i]);
+  int iconSize = ICON_SIZE;
+#if RAIL_LARGE_ICONS
+  if (large && icon) {
+    icon = icon == ICON_CLAUDE ? ICON_CLAUDE_L : ICON_OPENAI_L;
+    iconSize = ICON_L_SIZE;
+  }
+#endif
+  drawRing(x0, y0, D, used, used < 0 ? C_TRACK : ringColor(agents[i], used), track, icon, orbitDeg, iconSize);
   if (!agentIcon(agents[i])) {                        // initial letter for agents without a mark
     char l[2] = {(char)toupper(agents[i][0]), 0};
     display.setTextSize(3);
@@ -452,22 +448,33 @@ void drawAgentRing(int i, int x0, int y0, int D, float orbitDeg) {
   }
 }
 
-void drawFooter() {
-  const int left = shown == SCR_STATUS ? 50 : 6;       // the rail has a small cat bottom-left
-  display.fillRect(left > 6 ? left : 0, H - 18, W, 18, C_BG);
+static inline int NP(float v);
+
+// GLCD 5x7 when f is null, otherwise a free font
+void useFont(const GFXfont *f) {
+  display.setFreeFont(f);
+  if (!f) display.setTextFont(1);
   display.setTextSize(1);
+}
+
+void drawFooter() {
+  const bool rail = shown == SCR_STATUS, nat = nativeNow();   // the rail has a small cat bottom-left
+  const int left = rail ? RAIL_TEXT_X : nat ? NP(6) : 6, sw = nat ? RW : W, y = nat ? RAIL_FOOT_Y : H - 13;
+  display.fillRect(rail ? left : 0, y - 5, sw - (rail ? left : 0), (nat ? RH : H) - y + 5, C_BG);
+  useFont(nat ? RAIL_SMALL_FONT : nullptr);
   if (toastUntil > millis()) {
     display.setTextColor(C_NEED, C_BG);
-    display.drawString(toast, left, H - 13);
+    display.drawString(toast, left, y);
   } else {
     display.setTextColor(C_DIM, C_BG);
-    display.drawString(haveHost ? "USB linked" : "waiting for acsd", left, H - 13);
+    display.drawString(haveHost ? "USB linked" : "waiting for acsd", left, y);
   }
   char bat[12];
   if (batteryPct < 0) strlcpy(bat, "USB", sizeof(bat));
   else snprintf(bat, sizeof(bat), "%s~%d%%", charging ? "+" : "", batteryPct);
   display.setTextColor(batteryPct >= 0 && batteryPct <= 15 ? C_ERR : C_DIM, C_BG);
-  display.drawString(bat, W - 6 - display.textWidth(bat), H - 13);
+  display.drawString(bat, sw - 6 - display.textWidth(bat), y);
+  useFont(nullptr);
 }
 
 // ── boot screen: calico pixel cat on cream (docs/DESIGN.md) ─────────────────
@@ -547,65 +554,67 @@ void drawWait() {
 }
 
 RailGeo railGeo() {
+  if (agentCount == 2) return {RAIL_D, RAIL_TOP, RAIL_STEP, true};   // the rail always shows Claude and Codex
   if (agentCount <= 1) return {112, 26, 0, true};
-  if (agentCount == 2) return {96, 6, 136, true};
   return {70, 4, 90, false};
 }
 
-// Text under a ring: bold percentage, then the reset line
+// Text under a ring: bold percentage, then the reset line (native rail: also the weekly figure)
 void drawRingCaption(int i, int yTop, const RailGeo &g) {
   const Usage *u = agentUsage(agents[i]);
-  display.fillRect(0, yTop, W, g.detailLine ? 32 : 20, C_BG);
+  display.fillRect(0, yTop, RW, g.detailLine ? RAIL_LINE_DY + 18 : RAIL_PCT_H, C_BG);
   char pct[8];
   if (u && u->avail) snprintf(pct, sizeof(pct), "%d%%", u->win[0].used);
   else strlcpy(pct, "--", sizeof(pct));
-  display.setFreeFont(&FreeSansBold12pt7b);
+  useFont(RAIL_PCT_FONT);
   display.setTextColor(u && u->avail ? C_FG : C_DIM);
-  display.drawString(pct, (W - display.textWidth(pct)) / 2, yTop);
-  display.setFreeFont(NULL);
-  display.setTextFont(1);
-  if (!g.detailLine) return;
-  char line[28];
+  display.drawString(pct, (RW - display.textWidth(pct)) / 2, yTop);
+  if (!g.detailLine) return useFont(nullptr);
+  char line[40];
   if (u && u->avail) {
     char rs[12];
     fmtReset(u->win[0].resets - nowSeconds(), rs, sizeof(rs));
-    snprintf(line, sizeof(line), "%s  resets %s", u->win[0].k, rs);
+    if (RAIL_SMALL_FONT && u->n > 1)
+      snprintf(line, sizeof(line), "%s resets %s   %s %d%%", u->win[0].k, rs, u->win[1].k, u->win[1].used);
+    else
+      snprintf(line, sizeof(line), "%s  resets %s", u->win[0].k, rs);
   } else {
     snprintf(line, sizeof(line), "%s  usage n/a", agentName(agents[i]));
   }
-  display.setTextSize(1);
+  useFont(RAIL_SMALL_FONT);
   display.setTextColor(C_DIM, C_BG);
-  display.drawString(line, (W - display.textWidth(line)) / 2, yTop + 22);
+  display.drawString(line, (RW - display.textWidth(line)) / 2, yTop + RAIL_LINE_DY);
+  useFont(nullptr);
 }
 
-static constexpr int STATUS_Y = H - 46, STATUS_TEXT_X = 50;
-
 void drawStatusLine() {
-  const int y = STATUS_Y;
-  display.fillRect(0, y, W, H - 18 - y, C_BG);
+  const int y = RAIL_STATUS_Y, big = RAIL_STATE_FONT != nullptr;
+  display.fillRect(0, y - 4, RW, RAIL_FOOT_Y - 6 - (y - 4), C_BG);
   const Session *s = topSession(nullptr);
-  drawCatTile(catFor(s ? s->st : nullptr), 3, y - 2, 2);          // 42x36 tile
-  display.setTextSize(1);
+  drawCatTile(catFor(s ? s->st : nullptr), 3, y - 2, RAIL_CAT_SCALE);
   if (!s) {
+    useFont(RAIL_SMALL_FONT);
     display.setTextColor(C_DIM, C_BG);
-    display.drawString("no sessions", STATUS_TEXT_X, y + 4);
-    return;
+    display.drawString("no sessions", RAIL_TEXT_X, y + 4);
+    return useFont(nullptr);
   }
-  display.setTextColor(stateColor(s->st), C_BG);
   bool turn = unseen() && (!strcmp(s->st, "done") || !strcmp(s->st, "needs_you"));
-  if (turn && !pulseOn) display.setTextColor(C_BG, C_BG);                 // blink
-  display.drawString(turn ? "YOUR TURN" : stateWord(s->st), STATUS_TEXT_X, y + 4);
+  useFont(RAIL_STATE_FONT);
+  display.setTextColor(turn && !pulseOn ? C_BG : stateColor(s->st), C_BG);   // blink
+  display.drawString(turn ? "YOUR TURN" : stateWord(s->st), RAIL_TEXT_X, y + (big ? 6 : 4));
   char label[10];
   strlcpy(label, s->label, sizeof(label));
+  useFont(RAIL_SMALL_FONT);
   display.setTextColor(C_DIM, C_BG);
-  display.drawString(label, W - 6 - display.textWidth(label), y + 4);
+  display.drawString(label, RW - 6 - display.textWidth(label), y + (big ? 6 : 4));
   if (s->tool[0]) {
-    char buf[22];
+    char buf[30];
     snprintf(buf, sizeof(buf), "%s %s", s->tool, s->target);
-    buf[19] = 0;
+    buf[big ? 24 : 19] = 0;
     display.setTextColor(0xBDF7, C_BG);
-    display.drawString(buf, STATUS_TEXT_X, y + 17);
+    display.drawString(buf, RAIL_TEXT_X, y + (big ? 28 : 17));
   }
+  useFont(nullptr);
 }
 
 // Full-screen cat pages on cream: cat mode follows the most urgent session; the your-turn card waits for a tap
@@ -645,10 +654,7 @@ float orbit = 0;   // degrees, advanced by loop() while an agent works
 void drawRail() {
   display.fillScreen(C_BG);
   if (!agentCount) {
-    drawRing((W - 96) / 2, 50, 96, -1, C_TRACK, C_TRACK, nullptr, -1);
-    display.setTextSize(1);
-    display.setTextColor(C_DIM, C_BG);
-    display.drawString("no agents yet", (W - display.textWidth("no agents yet")) / 2, 164);
+    drawRing((RW - 96) / 2, 50, 96, -1, C_TRACK, C_TRACK, nullptr, -1);
     drawStatusLine();
     drawFooter();
     return;
@@ -656,18 +662,19 @@ void drawRail() {
   RailGeo g = railGeo();
   for (int i = 0; i < agentCount; i++) {
     int y = g.top + i * g.step;
-    drawAgentRing(i, (W - g.d) / 2, y, g.d, agentBusy(agents[i]) ? orbit : -1);
+    drawAgentRing(i, (RW - g.d) / 2, y, g.d, agentBusy(agents[i]) ? orbit : -1, true);
     drawRingCaption(i, y + g.d + 4, g);
   }
   drawStatusLine();
   drawFooter();
 }
 
-// Animation frame: redraw only the rings of agents that are working
-void animateRail() {
+// Animation frame: redraw only the rings of agents that are working (or pulsing, with busy = false)
+void animateRail(bool busy = true) {
   RailGeo g = railGeo();
   for (int i = 0; i < agentCount; i++)
-    if (agentBusy(agents[i])) drawAgentRing(i, (W - g.d) / 2, g.top + i * g.step, g.d, orbit);
+    if (agentBusy(agents[i]) == busy)
+      drawAgentRing(i, (RW - g.d) / 2, g.top + i * g.step, g.d, busy ? orbit : -1, true);
 }
 
 // Detail card for one agent, like Pulse's hover card
@@ -735,44 +742,57 @@ void drawDetail() {
 }
 
 // Button geometry on the permission screen
-static constexpr int ALLOW_Y = 204, ALLOW_H = 50, DENY_Y = 262, DENY_H = 34;
+static constexpr int ALLOW_Y = 204, ALLOW_H = 50, DENY_Y = 262, DENY_H = 34;   // logical: touch zones use these
 
-static constexpr int SPLIT_X = 88;           // left: allow once · right: allow for this session
+static constexpr int SPLIT_X = W / 2 + 2;    // left: allow once · right: allow for this session
 static constexpr uint32_t SESSION_HOLD_MS = 1500;
 static constexpr uint16_t C_SESS = 0x0451;      // teal
 
+// Drawing position for a logical coordinate (the AMOLED draws this screen natively at 1.425x)
+static inline int NP(float v) { return (int)(v * NS + 0.5f); }
+
+void useStyle(const TextStyle &t) {
+  display.setFreeFont(t.font);
+  if (!t.font) display.setTextFont(1);
+  display.setTextSize(t.size);
+}
+
 void drawOneAllow(int x, int w, uint16_t c, float progress, const char *title, const char *sub) {
-  display.fillRoundRect(x, ALLOW_Y, w, ALLOW_H, 8, c);
-  if (progress > 0) display.fillRoundRect(x, ALLOW_Y, max(16, (int)(w * progress)), ALLOW_H, 8, C_HOLD);
-  display.setFreeFont(&FreeSansBold9pt7b);
+  const int nx = NP(x), nw = NP(x + w) - nx, ny = NP(ALLOW_Y), nh = NP(ALLOW_H);
+  display.fillRoundRect(nx, ny, nw, nh, NP(8), c);
+  if (progress > 0) display.fillRoundRect(nx, ny, max(NP(16), (int)(nw * progress)), nh, NP(8), C_HOLD);
+  useStyle(P_BTN);
   display.setTextColor(C_FG);
-  display.drawString(title, x + (w - display.textWidth(title)) / 2, ALLOW_Y + 9);
-  display.setFreeFont(NULL);
-  display.setTextFont(1);
-  display.setTextSize(1);
-  display.drawString(sub, x + (w - display.textWidth(sub)) / 2, ALLOW_Y + 34);
+  display.drawString(title, nx + (nw - display.textWidth(title)) / 2, ny + NP(9));
+  useStyle(P_SMALL);
+  display.drawString(sub, nx + (nw - display.textWidth(sub)) / 2, ny + NP(33));
+  useFont(nullptr);
 }
 
 // progress: 0..1 for the button being held; which: 0 = once, 1 = session
 void drawAllowButton(float progress, int which = 0) {
   if (pend.kind == K_ASK) return;                  // options are drawn by drawOptions()
+  char hint[24];
+  snprintf(hint, sizeof(hint), "hold here or %s", BTN_A_NAME);
   if (pend.high || pend.trunc) {
     const char *msg = pend.kind == K_YESNO ? "ANSWER AT KEYBOARD" : "APPROVE AT KEYBOARD";
-    display.fillRoundRect(8, ALLOW_Y, W - 16, ALLOW_H, 8, C_LINE);
-    display.setTextSize(1);
+    display.fillRoundRect(NP(8), NP(ALLOW_Y), NP(W - 8) - NP(8), NP(ALLOW_H), NP(8), C_LINE);
+    useStyle(P_LABEL);
     display.setTextColor(C_FG, C_LINE);
-    display.drawString(msg, (W - display.textWidth(msg)) / 2, ALLOW_Y + 21);
-    return;
+    display.drawString(msg, (NP(W) - display.textWidth(msg)) / 2, NP(ALLOW_Y + 19));
+    return useFont(nullptr);
   }
   if (pend.kind == K_YESNO) {
-    drawOneAllow(8, W - 16, C_ALLOW, progress, progress > 0 ? "Hold..." : "Yes", "hold here or USR1");
+    drawOneAllow(8, W - 16, C_ALLOW, progress, progress > 0 ? "Hold..." : "Yes", hint);
     return;
   }
   if (!pend.sess) {
-    drawOneAllow(8, W - 16, C_ALLOW, progress, progress > 0 ? "Hold..." : "Allow", "hold here or USR1");
+    drawOneAllow(8, W - 16, C_ALLOW, progress, progress > 0 ? "Hold..." : "Allow", hint);
     return;
   }
-  drawOneAllow(8, SPLIT_X - 12, C_ALLOW, which == 0 ? progress : 0, "Allow", "once / USR1");
+  char once[16];
+  snprintf(once, sizeof(once), "once / %s", BTN_A_NAME);
+  drawOneAllow(8, SPLIT_X - 12, C_ALLOW, which == 0 ? progress : 0, "Allow", once);
   drawOneAllow(SPLIT_X, W - 8 - SPLIT_X, C_SESS, which == 1 ? progress : 0, "Always", "this session");
 }
 
@@ -783,15 +803,15 @@ int optionHeight() { return (OPT_Y1 - OPT_Y0 - (pend.nopts - 1) * 4) / max(1, pe
 
 void drawOption(int i, float progress) {
   int h = optionHeight(), y = OPT_Y0 + i * (h + 4);
-  display.fillRoundRect(8, y, W - 16, h, 6, C_SESS);
-  if (progress > 0) display.fillRoundRect(8, y, max(12, (int)((W - 16) * progress)), h, 6, C_HOLD);
-  display.setFreeFont(&FreeSansBold9pt7b);
+  const int ny = NP(y), nh = NP(y + h) - ny, nw = NP(W - 8) - NP(8);
+  display.fillRoundRect(NP(8), ny, nw, nh, NP(6), C_SESS);
+  if (progress > 0) display.fillRoundRect(NP(8), ny, max(NP(12), (int)(nw * progress)), nh, NP(6), C_HOLD);
+  useStyle(P_BTN);
   display.setTextColor(C_FG);
-  char label[20];
+  char label[24];
   strlcpy(label, pend.opts[i], sizeof(label));
-  display.drawString(label, 16, y + (h - 14) / 2);
-  display.setFreeFont(NULL);
-  display.setTextFont(1);
+  display.drawString(label, NP(16), ny + (nh - NP(14)) / 2);
+  useFont(nullptr);
 }
 
 void drawOptions() {
@@ -811,12 +831,13 @@ void drawCountdown() {
     long l = pend.exp - now;
     snprintf(right, sizeof(right), "%ld:%02ld left", max(0L, l) / 60, max(0L, l) % 60);
   }
-  display.fillRect(0, META_Y - 2, W, 14, C_BG);
-  display.setTextSize(1);
+  display.fillRect(0, NP(META_Y - 3), NP(W), NP(16), C_BG);
+  useStyle(P_SMALL);
   display.setTextColor(C_DIM, C_BG);
-  display.drawString(left, 10, META_Y);
+  display.drawString(left, NP(10), NP(META_Y));
   display.setTextColor(pendingCount > 1 ? C_FG : C_DIM, C_BG);
-  display.drawString(right, W - 10 - display.textWidth(right), META_Y);
+  display.drawString(right, NP(W - 10) - display.textWidth(right), NP(META_Y));
+  useFont(nullptr);
 }
 
 void showPending(int i) {
@@ -828,62 +849,71 @@ void showPending(int i) {
 
 void drawPermission() {
   display.fillScreen(C_BG);
-  drawCatTile(CAT_MEOW, 4, 8, 3);                                // 60x51 tile
-  display.setTextSize(1);
+  drawCatTile(CAT_MEOW, NP(4), NP(8), P_CAT_SCALE);
+  const int tx = NP(4) + CAT_W * P_CAT_SCALE + 6 + NP(10);       // text column right of the cat tile
+  useStyle(P_LABEL);
   display.setTextColor(C_NEED, C_BG);
-  display.drawString(pend.kind == K_PERM ? "PERMISSION" : "QUESTION", 74, 10);
+  display.drawString(pend.kind == K_PERM ? "PERMISSION" : "QUESTION", tx, NP(10));
   if (pend.high && pend.kind == K_PERM) {
     display.setTextColor(C_ERR, C_BG);
-    display.drawString("HIGH", W - 8 - display.textWidth("HIGH"), 10);
+    display.drawString("HIGH", NP(W - 8) - display.textWidth("HIGH"), NP(10));
   }
+  useStyle(P_SMALL);
   display.setTextColor(C_DIM, C_BG);
   char who[28];
   snprintf(who, sizeof(who), "%s / %s", agentName(pend.agent), pend.label);
-  who[16] = 0;
-  display.drawString(who, 74, 24);
-  display.setTextSize(2);
+  while (strlen(who) > 1 && display.textWidth(who) > NP(W) - tx - NP(4)) who[strlen(who) - 1] = 0;
+  display.drawString(who, tx, NP(25));
+  useStyle(P_TITLE);
   display.setTextColor(C_FG, C_BG);
   char tool[22];
   snprintf(tool, sizeof(tool), "%s %s", pend.tool, pend.qpos);
-  tool[8] = 0;                                                  // size-2 text: 8 chars fit beside the cat
-  display.drawString(tool, 74, 42);
-  // literal text: large font when short, small otherwise
+  while (strlen(tool) > 1 && display.textWidth(tool) > NP(W) - tx - NP(4)) tool[strlen(tool) - 1] = 0;
+  display.drawString(tool, tx, NP(42));
+  // literal text in a fixed-width font: large when short, small otherwise
+  useFont(nullptr);
   display.setTextColor(0xE71C, C_BG);
-  int len = strlen(pend.text);
-  if (len <= 39) {
-    drawWrapped(pend.text, 10, 80, 13, 18, 5);
+  const int bigCols = (NP(W) - NP(20)) / (6 * P_CMD_BIG), smallCols = (NP(W) - NP(20)) / (6 * P_CMD_SMALL);
+  if ((int)strlen(pend.text) <= bigCols * 3) {
+    display.setTextSize(P_CMD_BIG);
+    drawWrapped(pend.text, NP(10), NP(80), bigCols, NP(18), 5);
   } else {
-    display.setTextSize(1);
-    drawWrapped(pend.text, 10, 80, 26, 11, 9);
+    display.setTextSize(P_CMD_SMALL);
+    drawWrapped(pend.text, NP(10), NP(80), smallCols, NP(11), 9);
   }
   if (pend.trunc) {
     char buf[20];
     snprintf(buf, sizeof(buf), "...+%d chars", pend.trunc);
-    display.setTextSize(1);
+    useStyle(P_SMALL);
     display.setTextColor(C_ERR, C_BG);
-    display.drawString(buf, 10, 174);
+    display.drawString(buf, NP(10), NP(172));
   }
   drawCountdown();
   if (pend.kind == K_ASK) {
     drawOptions();
-    display.setTextSize(1);
+    char hint[32];
+    snprintf(hint, sizeof(hint), "%s: answer at keyboard", BTN_B_NAME);
+    useStyle(P_SMALL);
     display.setTextColor(C_DIM, C_BG);
-    display.drawString("USR2: answer at keyboard", 8, H - 13);
-    return;
+    display.drawString(hint, NP(8), NP(H - 14));
+    return useFont(nullptr);
   }
   drawAllowButton(0);
-  display.fillRoundRect(8, DENY_Y, W - 16, DENY_H, 8, C_DENY);
-  display.setTextSize(2);
+  display.fillRoundRect(NP(8), NP(DENY_Y), NP(W - 8) - NP(8), NP(DENY_H), NP(8), C_DENY);
+  useStyle(P_DENY);
   display.setTextColor(C_FG);
-  display.drawString(pend.kind == K_YESNO ? "NO" : "DENY", 24, DENY_Y + 10);
-  display.setTextSize(1);
-  display.drawString("tap / USR2", W - 20 - display.textWidth("tap / USR2"), DENY_Y + 14);
+  display.drawString(pend.kind == K_YESNO ? "NO" : "DENY", NP(24), NP(DENY_Y + 9));
+  char hint[24];
+  snprintf(hint, sizeof(hint), HAS_BTN_B ? "tap / %s" : "tap", BTN_B_NAME);
+  useStyle(P_SMALL);
+  display.drawString(hint, NP(W - 20) - display.textWidth(hint), NP(DENY_Y + 13));
+  useFont(nullptr);
   drawFooter();
 }
 
 // ── input ───────────────────────────────────────────────────────────────────
 struct Btn { uint8_t pin; bool down; uint32_t since; bool fired; };
-Btn usr1{USR1_PIN, false, 0, false}, usr2{USR2_PIN, false, 0, false};
+Btn usr1{BTN_A_PIN, false, 0, false}, usr2{BTN_B_PIN, false, 0, false};
 
 uint32_t allowSince = 0;
 bool allowFired = false, denyArmed = false;
@@ -913,7 +943,8 @@ void handleTouch() {
         RailGeo g = railGeo();
         for (int i = 0; i < agentCount; i++) {
           int top = g.top + i * g.step;
-          if (tapY >= top && tapY < top + g.d + 30) {
+          int ty = tapY * RH / H;                    // touch is in logical units; the rail may be native
+          if (ty >= top && ty < top + g.d + RAIL_LINE_DY + 10) {
             detailAgent = i;
             detailSince = millis();
             dirty = true;
@@ -976,10 +1007,18 @@ void handleTouch() {
     lastProgress = 0;
   }
   bool inDeny = touching && y >= DENY_Y && y < DENY_Y + DENY_H;
+  static uint32_t denySince = 0;
+  static bool denyHeld = false;          // held 1.5 s: deny + stop (yes/no: answer at keyboard)
+  if (inDeny && !denyArmed) denySince = millis();
   if (inDeny) denyArmed = true;
+  if (inDeny && !denyHeld && millis() - denySince >= STOP_HOLD_MS) {
+    sendDecide("deny_stop");
+    setToast("Denied + stopped");
+    denyHeld = true;
+  }
   if (!touching && startX >= 0) {        // released
     int dx = lastX - startX;
-    if (denyArmed) {
+    if (denyArmed && !denyHeld) {
       sendDecide("deny");
       setToast("Denied");
     } else if (startY < ALLOW_Y && abs(dx) > 40) {                   // swipe between queued requests
@@ -988,6 +1027,7 @@ void handleTouch() {
       showPending(pendCur + (startX < W / 2 ? -1 : 1));
     }
     denyArmed = false;
+    denyHeld = false;
     allowFired = false;
     holdWhich = -1;
     startX = startY = -1;
@@ -997,7 +1037,7 @@ void handleTouch() {
 void handleButtons() {
   uint32_t now = millis();
   bool d1 = digitalRead(usr1.pin) == LOW;
-  bool d2 = digitalRead(usr2.pin) == LOW;
+  bool d2 = HAS_BTN_B && digitalRead(usr2.pin) == LOW;
   // Any press on a sleeping screen only wakes it.
   if (asleep && ((d1 && !usr1.down) || (d2 && !usr2.down))) {
     wake();
@@ -1018,7 +1058,7 @@ void handleButtons() {
     usr1.since = now;
     usr1.fired = false;
     if (pendingCount && pend.kind == K_ASK) {
-      setToast("Hold an option");
+      sendDecide("deny");                              // multiple choice: the button hands it to the keyboard
       usr1.fired = true;
     } else if (pendingCount && (pend.high || pend.trunc)) {
       setToast("Approve at keyboard");
@@ -1037,13 +1077,22 @@ void handleButtons() {
       setToast("Allowed (USR1)");
     }
   }
+  if (!HAS_BTN_B && d1 && !usr1.fired && !pendingCount && now - usr1.since >= STOP_HOLD_MS) {
+    blIndex = (blIndex + 1) % sizeof(BL_LEVELS);    // one-button board: hold = brightness
+    setBacklight(BL_LEVELS[blIndex]);
+    usr1.fired = true;
+  }
   if (!d1 && usr1.down && !usr1.fired) {
     if (pendingCount && shown == SCR_PERM) {        // released too early: reset the progress bar
       drawAllowButton(0);
       lastProgress = 0;
-    } else if (!pendingCount) {
+    } else if (!pendingCount && HAS_BTN_B) {
       blIndex = (blIndex + 1) % sizeof(BL_LEVELS);
-      analogWrite(LCD_BL_PIN, BL_LEVELS[blIndex]);
+      setBacklight(BL_LEVELS[blIndex]);
+    } else if (!pendingCount && agentCount) {       // one-button board: short = next page
+      detailAgent = detailAgent + 1 <= agentCount ? detailAgent + 1 : -1;
+      detailSince = now;
+      dirty = true;
     }
   }
   usr1.down = d1;
@@ -1082,39 +1131,20 @@ int lipoPercent(float v) {
 }
 
 void readBattery() {
-  NRF_P0->OUTCLR = (1UL << READ_BAT_P0_PIN);   // enable the divider (active-low sink)
-  NRF_P0->DIRSET = (1UL << READ_BAT_P0_PIN);
-  delay(20);
-  int lo = 4095, hi = 0;
-  long sum = 0;
-  for (int i = 0; i < 16; i++) {
-    int r = analogRead(PIN_VBAT);
-    lo = min(lo, r);
-    hi = max(hi, r);
-    sum += r;
-    delay(2);
-  }
-  NRF_P0->DIRCLR = (1UL << READ_BAT_P0_PIN);   // divider off
-  float vbat = (sum / 16.0f) * 3.6f / 4095.0f * BAT_DIVIDER;
-  charging = (NRF_P0->IN & (1UL << CHG_P0_PIN)) == 0;
-  // Without a cell the charger node floats and reads noisy: report USB instead of a fake percentage.
-  batteryPct = (hi - lo > 60 || vbat < 3.0f) ? -1 : lipoPercent(vbat);
+  float vbat;
+  batteryPct = boardBattery(vbat, charging) ? lipoPercent(vbat) : -1;
 }
 
 // ── main ────────────────────────────────────────────────────────────────────
 void setup() {
+#if defined(ARDUINO_ARCH_ESP32)
+  Serial.setRxBufferSize(8192);   // default 256 B: a 1-2 KB snapshot overflows it while a frame is being scaled
+#endif
   Serial.begin(115200);
-  pinMode(USR1_PIN, INPUT_PULLUP);
-  pinMode(USR2_PIN, INPUT_PULLUP);
-  nrf_gpio_cfg_input(CHG_P0_PIN, NRF_GPIO_PIN_PULLUP);
-  analogReadResolution(12);
-  if (!display.begin<Board_XIAO_1inch47_Touch_Display<LCD_RST_PIN, LCD_BL_PIN>,
-                     Config_Seeed_1inch47_Touch_JD9853A>()) {
-    return;
-  }
-  display.attachTouch(touch, display.panel().driver().bus());
-  pinMode(LCD_BL_PIN, OUTPUT);
-  analogWrite(LCD_BL_PIN, BL_LEVELS[blIndex]);
+  pinMode(BTN_A_PIN, INPUT_PULLUP);
+  if (HAS_BTN_B) pinMode(BTN_B_PIN, INPUT_PULLUP);
+  if (!boardBegin()) return;
+  setBacklight(BL_LEVELS[blIndex]);
   readBattery();
   lastActivity = millis();
   drawWait();
@@ -1145,6 +1175,7 @@ void loop() {
   Screen want = (!haveHost || linkedMoment) ? SCR_WAIT : pendingCount ? SCR_PERM : unseen() ? SCR_TURN : detailAgent == agentCount ? SCR_CAT : detailAgent >= 0 ? SCR_DETAIL : SCR_STATUS;
   if (want != shown || dirty) {
     shown = want;
+    useNativeRail(want == SCR_STATUS || want == SCR_PERM);   // drawn natively where the board supports it
     if (want == SCR_WAIT) drawWait();
     else if (want == SCR_STATUS) drawRail();
     else if (want == SCR_DETAIL) drawDetail();
@@ -1175,7 +1206,7 @@ void loop() {
   }
   if (!asleep && !pendingCount && !unseen() && now - lastActivity > SLEEP_AFTER_MS) {
     asleep = true;
-    analogWrite(LCD_BL_PIN, 0);
+    setBacklight(0);
   }
   static uint32_t lastZ = 0;
   static int zFrame = 0;
@@ -1188,9 +1219,7 @@ void loop() {
   if (unseen() && shown == SCR_STATUS && !asleep && now - lastPulse > 500) {
     lastPulse = now;
     pulseOn = !pulseOn;
-    RailGeo g = railGeo();
-    for (int i = 0; i < agentCount; i++)
-      if (!agentBusy(agents[i])) drawAgentRing(i, (W - g.d) / 2, g.top + i * g.step, g.d, -1);
+    animateRail(false);
     drawStatusLine();
   }
   static uint32_t lastFrame = 0;
@@ -1205,5 +1234,6 @@ void loop() {
   }
   handleTouch();
   handleButtons();
+  boardPresent();
   delay(10);
 }

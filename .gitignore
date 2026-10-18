@@ -2,3 +2,6 @@ firmware/lib/
 firmware/build/
 .run/
 __pycache__/
+firmware/tools/.venv/
+firmware/build-amoled/
+firmware/acs/build/

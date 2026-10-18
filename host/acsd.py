@@ -11,6 +11,8 @@ LIVE_WINDOW = 12     # device counts as live while an ack arrived this recently
 HEARTBEAT = 5
 MAX_TEXT = 200
 SESSION_GC = 2 * 3600
+MAX_SESSIONS = 6     # the device shows at most 6; more would overflow its line buffer
+SNAP_LIMIT = 2000    # firmware line buffer is 2100 bytes
 QUESTION_TTL = 120   # a held question blocks the terminal's own UI, so keep it short (hook timeout: 150 s)
 QUESTION_END = re.compile(r"[?？]\s*[*_`)\]]*\s*$")
 PULSE = "/Applications/Pulse.app/Contents/MacOS/Pulse"
@@ -180,15 +182,20 @@ class Daemon:
 
     def send_snap(self):
         now = time.time()
-        self.write({
+        snap = {
             "t": "snap", "rev": self.rev, "now": int(now),
             "sessions": [{k: s[k] for k in ("sid", "agent", "label", "st", "tool", "target")} | {"age": int(now - s["last"])}
-                         for s in sorted(self.sessions.values(), key=lambda s: -s["last"])],
+                         for s in sorted(self.sessions.values(), key=lambda s: -s["last"])[:MAX_SESSIONS]],
             "pending": [{k: p[k] for k in ("id", "sid", "agent", "label", "tool", "text", "trunc", "risk", "exp",
                                            "created", "sess", "kind", "opts", "qpos")}
-                        for p in self.pending.values()],
+                        for p in list(self.pending.values())[:4]],
             "usage": self.usage,
-        })
+        }
+        line = json.dumps(snap, separators=(",", ":"))
+        while len(line) > SNAP_LIMIT and snap["sessions"]:   # never let the device drop a whole snapshot
+            snap["sessions"].pop()
+            line = json.dumps(snap, separators=(",", ":"))
+        self.write(snap)
 
     def changed(self):
         self.rev += 1
