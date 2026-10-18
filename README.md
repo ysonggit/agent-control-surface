@@ -24,6 +24,18 @@ agent 每次开始工作、调用工具、请求权限或结束一轮时，会�
 
 ## 屏幕
 
+<table>
+  <tr>
+    <td align="center"><img src="docs/img/main.svg" width="170" alt="主屏：Claude 和 Codex 的用量圆环"><br>主屏</td>
+    <td align="center"><img src="docs/img/permission.svg" width="170" alt="高风险权限请求，只能在设备上拒绝"><br>权限请求</td>
+    <td align="center"><img src="docs/img/question.svg" width="170" alt="Claude 提问，Yes / No"><br>回答问题</td>
+    <td align="center"><img src="docs/img/your-turn.svg" width="170" alt="轮到你了"><br>轮到你了</td>
+    <td align="center"><img src="docs/img/boot.svg" width="170" alt="开机画面：睡觉的像素猫"><br>开机画面</td>
+  </tr>
+</table>
+
+以上是 1.64" AMOLED（280×456）布局的示意图，不是实拍，由 `firmware/tools/readme_screens.py` 生成。
+
 **主屏**（默认）：上面是 Claude，下面是 Codex，各一个用量圆环。弧线是 5 小时窗口的用量，从 12 点方向顺时针走；Claude 为橙色，到 90% 变红；Codex 按绿、橙、红变化。圆环下方是百分比、重置时间和 7 天用量。agent 工作时，一个白点沿圆环转圈。左下角的像素猫和文字显示最紧急的会话。读不到用量时显示灰色圆环和 `--`，不会显示成 0%。
 
 **详情卡**：点圆环打开，列出每个用量窗口和该 agent 的会话；再点一下或 10 秒后返回。
@@ -93,7 +105,7 @@ launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.agentcontrolsurface.
 - `host/test_e2e.py`：端到端测试（真实守护进程 + hook + 模拟设备）。
 - `host/demo.py`、`host/demo2.py`：在真实设备上逐屏演示。
 - `sim/device_sim.py`：终端里的设备模拟器。
-- `firmware/`：设备固件、`build.sh`、图标和像素猫生成脚本（`tools/`）。
+- `firmware/`：设备固件、`build.sh`、图标和像素猫生成脚本（`tools/`）；`tools/readme_screens.py` 生成 README 里的屏幕示意图。
 - `docs/PROTOCOL.md`：设备协议；`docs/DESIGN.md`：界面设计。
 
 ## 测试
