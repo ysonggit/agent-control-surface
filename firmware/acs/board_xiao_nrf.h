@@ -47,6 +47,7 @@ static constexpr int RAIL_D = 96, RAIL_TOP = 6, RAIL_STEP = 136, RAIL_LINE_DY = 
 #define RAIL_SMALL_FONT ((const GFXfont *)nullptr)   // 5x7 GLCD
 #define RAIL_STATE_FONT ((const GFXfont *)nullptr)
 #define RAIL_LARGE_ICONS 0
+#define HAS_CJK 0                                            // 1 MB flash: no CJK font; song text is filtered to ASCII
 
 // Permission screen: drawn in logical coordinates (scale 1)
 struct TextStyle { const GFXfont *font; uint8_t size; };   // font == nullptr: GLCD 5x7 at `size`
@@ -56,8 +57,15 @@ static const TextStyle P_LABEL{nullptr, 1}, P_SMALL{nullptr, 1}, P_TITLE{nullptr
 static constexpr int P_CMD_BIG = 2, P_CMD_SMALL = 1, P_CAT_SCALE = 3;
 static constexpr const char *BTN_A_NAME = "USR1", *BTN_B_NAME = "USR2";
 bool nativeNow() { return false; }
+// Other pages: titles, body text, the cat
+static const TextStyle S_TITLE{&FreeSansBold12pt7b, 1}, S_HEAD{&FreeSansBold9pt7b, 1}, S_BODY{&FreeSans9pt7b, 1},
+                       S_NOTE{nullptr, 1};
+static constexpr int CAT_SCALE = 6;
 
 void boardPresent() {}   // draws go straight to the panel
+
+// The XIAO's LSM6DS3 is not wired up yet: no face-down / pick-up handling on this board.
+bool boardImu(float &, float &, float &) { return false; }
 
 // Battery voltage (V) and charging; returns false when no cell is present (charger node floats and reads noisy)
 bool boardBattery(float &vbat, bool &charging) {

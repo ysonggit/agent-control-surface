@@ -73,7 +73,7 @@ class E2E(unittest.TestCase):
     def setUpClass(cls):
         cls.tmp = tempfile.mkdtemp()
         cls.sock = os.path.join(cls.tmp, "acsd.sock")
-        cls.env = dict(os.environ, ACS_SOCK=cls.sock)
+        cls.env = dict(os.environ, ACS_SOCK=cls.sock, CLAUDE_CODE_ENTRYPOINT="cli")   # a terminal session
         cls.dev = FakeDevice()
         cls.daemon = subprocess.Popen([sys.executable, os.path.join(HERE, "acsd.py"), "--serial", cls.dev.path,
                                        "--sock", cls.sock], stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
@@ -234,6 +234,28 @@ class E2E(unittest.TestCase):
         req = self.dev.wait_pending()
         self.dev.send({"t": "decide", "id": req["id"], "d": "release"})
         self.assertIsNone(self.output(p))
+
+    def test_hidden_source_passes_through(self):
+        t = time.time()
+        p = subprocess.Popen(HOOK, stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True,
+                             env=dict(self.env, CLAUDE_CODE_ENTRYPOINT="claude-desktop"))
+        out, _ = p.communicate(json.dumps(perm_event("touch hidden")), timeout=5)
+        self.assertEqual(out, "")                       # no decision: the desktop app's own dialog answers
+        self.assertLess(time.time() - t, 1.0)
+        snap = self.dev.snaps.get(timeout=6)            # and the session never reaches the device
+        self.assertFalse(any(s["sid"] == "sess-123" and s["label"] == "proj" and s["st"] == "needs_you"
+                             for s in snap["sessions"]) and snap["pending"])
+
+    def test_zy_do_not_disturb_releases_and_bypasses(self):
+        p = self.start_hook(perm_event("touch dnd"))
+        self.dev.wait_pending()
+        self.dev.send({"t": "dnd", "on": True})         # face down
+        self.assertIsNone(self.decision(p))             # handed back to the keyboard
+        t = time.time()
+        self.assertIsNone(self.decision(self.start_hook(perm_event("touch dnd2"))))
+        self.assertLess(time.time() - t, 1.0)
+        self.dev.send({"t": "dnd", "on": False})
+        time.sleep(0.3)
 
     def test_single_use(self):
         p = self.start_hook(perm_event("touch y"))

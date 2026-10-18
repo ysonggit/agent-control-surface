@@ -42,6 +42,11 @@ uint32_t snapAt = 0, lastSnapMs = 0;
 bool haveHost = false;
 uint32_t linkedUntil = 0;          // show the awake cat briefly after the host connects
 
+// Spotify on the Mac, as the host last saw it; pos is extrapolated from `at` while playing
+struct Media { bool on; bool playing; char title[96]; char artist[64]; char album[64]; long pos, dur; };
+Media media;
+uint32_t mediaAt = 0;
+
 struct UsageWin { char k[4]; int used; long resets; };
 struct Usage { bool avail; UsageWin win[2]; int n; };
 Usage usageClaude, usageCodex;
@@ -78,7 +83,7 @@ bool charging = false;
 char toast[40] = "";
 uint32_t toastUntil = 0;
 
-enum Screen { SCR_NONE, SCR_WAIT, SCR_STATUS, SCR_DETAIL, SCR_CAT, SCR_TURN, SCR_PERM };
+enum Screen { SCR_NONE, SCR_WAIT, SCR_STATUS, SCR_DETAIL, SCR_CAT, SCR_MP3, SCR_TURN, SCR_PERM };
 Screen shown = SCR_NONE;
 bool dirty = true;
 
@@ -86,12 +91,16 @@ bool dirty = true;
 static char line[2100];
 static size_t lineLen = 0;
 
-void sendHello() { Serial.printf(("{\"t\":\"hello\",\"fw\":\"0.9.0\",\"board\":\"" BOARD_NAME "\",\"w\":%d,\"h\":%d}\n"), W, H); }
+bool dnd = false;       // lying face down: screen off, nothing routed here
+bool dimmed = false;    // idle: dimmed before it sleeps (less OLED wear)
+
+void sendHello() { Serial.printf(("{\"t\":\"hello\",\"fw\":\"0.14.0\",\"board\":\"" BOARD_NAME "\",\"w\":%d,\"h\":%d,\"dnd\":%s}\n"), W, H, dnd ? "true" : "false"); }
 
 void wake() {
+  if (dnd) return;      // only turning the device face up ends do-not-disturb
   lastActivity = millis();
-  if (asleep) {
-    asleep = false;
+  if (asleep || dimmed) {
+    asleep = dimmed = false;
     setBacklight(BL_LEVELS[blIndex]);
   }
 }
@@ -228,8 +237,26 @@ void handleMessage(const char *json) {
     }
     parseUsage(usageClaude, doc["usage"]["claude"]);
     parseUsage(usageCodex, doc["usage"]["codex"]);
+    JsonObjectConst m = doc["media"];
+    Media nm;
+    memset(&nm, 0, sizeof(nm));
+    nm.on = !m.isNull() && m["title"];
+    if (nm.on) {
+      copyStr(nm.title, sizeof(nm.title), m["title"]);
+      copyStr(nm.artist, sizeof(nm.artist), m["artist"]);
+      copyStr(nm.album, sizeof(nm.album), m["album"]);
+      nm.playing = !strcmp(m["st"] | "", "playing");
+      nm.pos = m["pos"] | 0L;
+      nm.dur = m["dur"] | 0L;
+    }
+    if (memcmp(&nm, &media, sizeof(nm))) {          // the host only sends a position when it jumps
+      if (strcmp(nm.title, media.title)) resetMarquee();
+      media = nm;
+      mediaAt = millis();
+      if (shown == SCR_MP3) dirty = true;
+    }
     collectAgents();
-    if (detailAgent >= agentCount) detailAgent = -1;
+    if (detailAgent > agentCount + 1) detailAgent = -1;   // pages: details, cat mode, MP3
     // Redraw only when what is shown changed; the 5 s heartbeat alone must not flicker the screen.
     uint32_t h = fnv(2166136261u, sessions, sizeof(sessions));
     h = fnv(h, &sessionCount, sizeof(sessionCount));
@@ -448,7 +475,15 @@ void drawAgentRing(int i, int x0, int y0, int D, float orbitDeg, bool large = fa
   }
 }
 
-static inline int NP(float v);
+// Drawing position for a logical coordinate: x1 on the XIAO, x1.425 on the AMOLED, which draws every screen natively.
+// Touch zones stay in logical coordinates.
+static inline int NP(float v) { return (int)(v * NS + 0.5f); }
+
+void useStyle(const TextStyle &t) {
+  display.setFreeFont(t.font);
+  if (!t.font) display.setTextFont(1);
+  display.setTextSize(t.size);
+}
 
 // GLCD 5x7 when f is null, otherwise a free font
 void useFont(const GFXfont *f) {
@@ -479,7 +514,7 @@ void drawFooter() {
 
 // ── boot screen: calico pixel cat on cream (docs/DESIGN.md) ─────────────────
 static constexpr uint16_t C_CREAM = 0xF77C, C_INK = 0x18E3;
-static constexpr int CAT_SCALE = 6, CAT_X = (W - CAT_W * CAT_SCALE) / 2, CAT_Y = 64;
+static const int CAT_X = (RW - CAT_W * CAT_SCALE) / 2, CAT_Y = NP(64);
 
 uint16_t catColor(char c) {
   switch (c) {
@@ -524,12 +559,12 @@ void drawCatTile(CatSprite sprite, int x, int y, int scale) {
 // Sleeping "z", drifting up beside the right ear; frame 0..3
 void drawZ(int frame) {
   static const char Z[3][4] = {"###", ".#.", "###"};
-  const int zx = CAT_X + CAT_W * CAT_SCALE - 14, s = 4;
-  display.fillRect(zx, CAT_Y - 44, 3 * s, 40, C_CREAM);
-  int zy = CAT_Y - 16 - frame * 8;
+  const int zx = CAT_X + CAT_W * CAT_SCALE - NP(14), sz = NP(4);
+  display.fillRect(zx, CAT_Y - NP(44), 3 * sz, NP(40), C_CREAM);
+  int zy = CAT_Y - NP(16) - frame * NP(8);
   for (int y = 0; y < 3; y++)
     for (int x = 0; x < 3; x++)
-      if (Z[y][x] == '#') display.fillRect(zx + x * s, zy + y * s, s, s, 0x9CD4);
+      if (Z[y][x] == '#') display.fillRect(zx + x * sz, zy + y * sz, sz, sz, 0x9CD4);
 }
 
 void drawWait() {
@@ -537,20 +572,19 @@ void drawWait() {
   display.fillScreen(C_CREAM);
   drawCat(linked ? CAT_AWAKE : CAT_SLEEP);
   if (!linked) drawZ(0);
-  display.setFreeFont(&FreeSansBold12pt7b);
+  useStyle(S_TITLE);
   display.setTextColor(C_INK);
-  display.drawString("Hello Agent", (W - display.textWidth("Hello Agent")) / 2, 178);
-  display.setFreeFont(NULL);
-  display.setTextFont(1);
-  display.setTextSize(1);
+  display.drawString("Hello Agent", (RW - display.textWidth("Hello Agent")) / 2, NP(178));
+  useStyle(S_NOTE);
   const char *sub = linked ? "linked" : "waiting for acsd";
   display.setTextColor(linked ? 0x1CEC : 0x6B4E, C_CREAM);
-  display.drawString(sub, (W - display.textWidth(sub)) / 2, 208);
+  display.drawString(sub, (RW - display.textWidth(sub)) / 2, NP(208));
   char bat[12];
   if (batteryPct < 0) strlcpy(bat, "USB", sizeof(bat));
   else snprintf(bat, sizeof(bat), "%s~%d%%", charging ? "+" : "", batteryPct);
   display.setTextColor(0x8C71, C_CREAM);
-  display.drawString(bat, (W - display.textWidth(bat)) / 2, H - 16);
+  display.drawString(bat, (RW - display.textWidth(bat)) / 2, NP(H - 18));
+  useFont(nullptr);
 }
 
 RailGeo railGeo() {
@@ -621,15 +655,14 @@ void drawStatusLine() {
 void drawCatPage(CatSprite sprite, const char *title, uint16_t titleColor, const char *line1, const char *line2) {
   display.fillScreen(C_CREAM);
   drawCat(sprite);
-  display.setFreeFont(&FreeSansBold12pt7b);
+  useStyle(S_TITLE);
   display.setTextColor(titleColor);
-  display.drawString(title, (W - display.textWidth(title)) / 2, 178);
-  display.setFreeFont(NULL);
-  display.setTextFont(1);
-  display.setTextSize(1);
+  display.drawString(title, (RW - display.textWidth(title)) / 2, NP(178));
+  useStyle(S_NOTE);
   display.setTextColor(0x6B4E, C_CREAM);
-  display.drawString(line1, (W - display.textWidth(line1)) / 2, 208);
-  display.drawString(line2, (W - display.textWidth(line2)) / 2, 222);
+  display.drawString(line1, (RW - display.textWidth(line1)) / 2, NP(208));
+  display.drawString(line2, (RW - display.textWidth(line2)) / 2, NP(224));
+  useFont(nullptr);
 }
 
 void drawCatMode() {
@@ -647,6 +680,127 @@ void drawTurn() {
   char where[24] = "";
   if (s) snprintf(where, sizeof(where), "%s / %s", agentName(s->agent), s->label);
   drawCatPage(CAT_DONE, "Your turn", 0x1CEC, where, "tap to dismiss");
+}
+
+// ── MP3 page: Spotify on the Mac as a pocket MP3 player (idea from ysonggit/pi-walkman) ──
+static constexpr uint16_t C_SPOTIFY = 0x1DCA, C_LCD = 0x0124;
+static constexpr int EQ_BARS = 14;
+float eq[EQ_BARS];
+
+long mediaPos() {
+  long p = media.pos + (media.playing ? (long)((millis() - mediaAt) / 1000) : 0);
+  return media.dur ? min(p, media.dur) : p;
+}
+
+void mediaCommand(const char *cmd) {
+  if (!media.on) return setToast("Open Spotify on the Mac");
+  Serial.print(F("{\"t\":\"media\",\"cmd\":\""));
+  Serial.print(cmd);
+  Serial.println(F("\"}"));
+  if (!strcmp(cmd, "toggle")) {                      // show it at once; the host confirms within a second
+    media.pos = mediaPos();
+    mediaAt = millis();
+    media.playing = !media.playing;
+  }
+  resetMarquee();
+  setToast(!strcmp(cmd, "prev") ? "Previous" : !strcmp(cmd, "next") ? "Next" : media.playing ? "Play" : "Pause");
+}
+
+void fmtTime(long s, char *out, size_t n) { snprintf(out, n, "%ld:%02ld", max(0L, s) / 60, max(0L, s) % 60); }
+
+// Title, artist, album: UTF-8 on boards with a CJK font, ASCII otherwise; each row scrolls when too wide
+static int scroll[3];
+void resetMarquee() { scroll[0] = scroll[1] = scroll[2] = 0; }
+
+void textRow(int i, const char *text, int y, uint16_t color, bool big) {
+  char buf[96];
+#if HAS_CJK
+  strlcpy(buf, text, sizeof(buf));
+  display.setCjk(CJK_SIZE);
+  const int rowH = 17 * CJK_SIZE;
+#else
+  size_t n = 0;
+  for (const char *p = text; *p && n < sizeof(buf) - 1; p++)
+    if ((uint8_t)*p >= 32 && (uint8_t)*p < 127) buf[n++] = *p;
+  buf[n] = 0;
+  useStyle(big ? S_HEAD : S_NOTE);
+  const int rowH = NP(big ? 20 : 14);
+#endif
+  const int x = NP(10), w = NP(W - 10) - x;
+  display.fillRect(0, y - 1, NP(W), rowH + 2, C_BG);
+  display.setTextColor(color, C_BG);
+  int full = display.textWidth(buf);
+  if (full <= w) {
+    display.drawString(buf, x, y);
+  } else {
+    if (media.playing) scroll[i] = (scroll[i] + NP(2)) % (full + NP(40));
+    display.drawString(buf, x - scroll[i], y);
+    display.drawString(buf, x - scroll[i] + full + NP(40), y);
+  }
+  useFont(nullptr);
+}
+
+// Everything that moves: spectrum bars, scrolling text, progress. Redrawn every animation frame.
+void drawMp3Live() {
+  // spectrum analyser inside the display window
+  const int bx = NP(18), bw = NP(W - 36), base = NP(104), hmax = NP(64), gap = NP(3);
+  const int barW = (bw - (EQ_BARS - 1) * gap) / EQ_BARS;
+  display.fillRect(bx, base - hmax, bw, hmax, C_LCD);
+  for (int i = 0; i < EQ_BARS; i++) {
+    float target = media.playing ? 0.15f + (random(0, 85) / 100.0f) * (i < 4 || i > 10 ? 0.7f : 1.0f) : 0.06f;
+    eq[i] += (target - eq[i]) * 0.45f;
+    int h = max(NP(2), (int)(hmax * eq[i]));
+    display.fillRect(bx + i * (barW + gap), base - h, barW, h, C_SPOTIFY);
+  }
+  textRow(0, media.on ? media.title : "Spotify not running", NP(118), C_FG, true);
+  textRow(1, media.on ? media.artist : "Open Spotify on this Mac", NP(143), 0xC618, false);
+  textRow(2, media.on ? media.album : "", NP(167), C_DIM, false);
+  // progress and times
+  const int tx = NP(10), tw = NP(W - 10) - tx;
+  float p = media.on && media.dur ? (float)mediaPos() / media.dur : 0;
+  display.fillRect(0, NP(194), NP(W), NP(26), C_BG);
+  display.fillRoundRect(tx, NP(196), tw, NP(5), NP(2), C_TRACK);
+  if (p > 0) display.fillRoundRect(tx, NP(196), max(NP(5), (int)(tw * p)), NP(5), NP(2), C_SPOTIFY);
+  char a[12], b[12];
+  fmtTime(media.on ? mediaPos() : 0, a, sizeof(a));
+  fmtTime(media.dur, b, sizeof(b));
+  useStyle(S_NOTE);
+  display.setTextColor(C_DIM, C_BG);
+  display.drawString(a, tx, NP(205));
+  display.drawString(b, tx + tw - display.textWidth(b), NP(205));
+  useFont(nullptr);
+}
+
+void drawMp3() {
+  display.fillScreen(C_BG);
+  useStyle(S_HEAD);
+  display.setTextColor(C_FG, C_BG);
+  display.drawString("MP3", NP(10), NP(6));
+  useStyle(S_NOTE);
+  const char *st = !media.on ? "Spotify not running" : media.playing ? "Spotify  PLAYING" : "Spotify  PAUSED";
+  display.setTextColor(media.on ? C_SPOTIFY : C_DIM, C_BG);
+  display.drawString(st, NP(W - 10) - display.textWidth(st), NP(9));
+  display.fillRoundRect(NP(8), NP(30), NP(W - 16), NP(82), NP(10), C_LCD);        // the player's display window
+  drawMp3Live();
+  // controls under the three touch zones: previous, play/pause, next
+  const int cy = NP(244), s = NP(9), c1 = NP(W / 6), c2 = NP(W / 2), c3 = NP(5 * W / 6);
+  const uint16_t fg = media.on ? C_FG : C_DIM;
+  display.fillTriangle(c1 - s / 2, cy, c1 + s, cy - s, c1 + s, cy + s, fg);
+  display.fillTriangle(c1 - 2 * s, cy, c1 - s / 2, cy - s, c1 - s / 2, cy + s, fg);
+  if (media.playing) {
+    display.fillRect(c2 - s, cy - s, NP(5), 2 * s, fg);
+    display.fillRect(c2 + s - NP(5), cy - s, NP(5), 2 * s, fg);
+  } else {
+    display.fillTriangle(c2 - s, cy - s - NP(2), c2 - s, cy + s + NP(2), c2 + s + NP(3), cy, fg);
+  }
+  display.fillTriangle(c3 + s / 2, cy, c3 - s, cy - s, c3 - s, cy + s, fg);
+  display.fillTriangle(c3 + 2 * s, cy, c3 + s / 2, cy - s, c3 + s / 2, cy + s, fg);
+  useStyle(S_NOTE);
+  display.setTextColor(C_DIM, C_BG);
+  const char *hint = "tap  prev / play / next   swipe = page";
+  display.drawString(hint, (NP(W) - display.textWidth(hint)) / 2, NP(268));
+  useFont(nullptr);
+  drawFooter();
 }
 
 float orbit = 0;   // degrees, advanced by loop() while an agent works
@@ -677,67 +831,77 @@ void animateRail(bool busy = true) {
       drawAgentRing(i, (RW - g.d) / 2, g.top + i * g.step, g.d, busy ? orbit : -1, true);
 }
 
+// Pages: rail (-1) -> agent details (0..agentCount-1) -> cat mode (agentCount) -> MP3 (agentCount + 1) -> rail
+void showPage(int step) {
+  int n = agentCount + 3;                            // number of pages including the rail
+  int p = (detailAgent + 1 + step + n) % n;          // 0 = rail
+  detailAgent = p - 1;
+  detailSince = millis();
+  dirty = true;
+}
+
 // Detail card for one agent, like Pulse's hover card
 
 void drawDetail() {
   display.fillScreen(C_BG);
   const char *a = agents[detailAgent];
-  drawAgentRing(detailAgent, 6, 6, 64, agentBusy(a) ? orbit : -1);
-  display.setFreeFont(&FreeSansBold12pt7b);
+  drawAgentRing(detailAgent, NP(6), NP(6), NP(64), agentBusy(a) ? orbit : -1, NP(64) >= 90);
+  useStyle(S_TITLE);
   display.setTextColor(C_FG);
-  display.drawString(agentName(a), 78, 26);
-  int y = 82;
+  display.drawString(agentName(a), NP(78), NP(24));
+  int y = NP(82);
+  const int x0 = NP(8), xw = NP(W - 8) - x0;
   const Usage *u = agentUsage(a);
   if (!u || !u->avail) {
-    display.setFreeFont(&FreeSans9pt7b);
+    useStyle(S_BODY);
     display.setTextColor(C_DIM);
-    display.drawString("Usage unavailable", 8, y);
-    y += 30;
+    display.drawString("Usage unavailable", x0, y);
+    y += NP(30);
   } else {
     for (int i = 0; i < u->n; i++) {
       const UsageWin &w = u->win[i];
       char pct[8], rs[12], tail[24];
       const char *name = !strcmp(w.k, "5h") ? "5-hour" : !strcmp(w.k, "7d") ? "Weekly" : w.k;
-      display.setFreeFont(&FreeSansBold9pt7b);
+      useStyle(S_HEAD);
       display.setTextColor(C_FG);
-      display.drawString(name, 8, y);
+      display.drawString(name, x0, y);
       snprintf(pct, sizeof(pct), "%d%%", w.used);
-      display.drawString(pct, W - 8 - display.textWidth(pct), y);
-      display.fillRoundRect(8, y + 20, W - 16, 10, 5, C_TRACK);
-      int fill = (W - 16) * min(w.used, 100) / 100;
-      if (fill > 0) display.fillRoundRect(8, y + 20, max(fill, 10), 10, 5, ringColor(a, w.used));
+      display.drawString(pct, x0 + xw - display.textWidth(pct), y);
+      display.fillRoundRect(x0, y + NP(20), xw, NP(10), NP(5), C_TRACK);
+      int fill = xw * min(w.used, 100) / 100;
+      if (fill > 0) display.fillRoundRect(x0, y + NP(20), max(fill, NP(10)), NP(10), NP(5), ringColor(a, w.used));
       fmtReset(w.resets - nowSeconds(), rs, sizeof(rs));
       snprintf(tail, sizeof(tail), "resets in %s", rs);
-      display.setFreeFont(&FreeSans9pt7b);
+      useStyle(S_BODY);
       display.setTextColor(C_DIM);
-      display.drawString(tail, 8, y + 36);
-      y += 62;
+      display.drawString(tail, x0, y + NP(36));
+      y += NP(62);
     }
   }
-  display.drawFastHLine(8, y, W - 16, C_TRACK);
-  y += 8;
+  display.drawFastHLine(x0, y, xw, C_TRACK);
+  y += NP(8);
   int shown = 0;
-  for (int i = 0; i < sessionCount && y < H - 40; i++) {
+  for (int i = 0; i < sessionCount && y < NP(H - 40); i++) {
     if (strcmp(sessions[i].agent, a)) continue;
-    char label[10];
+    char label[12];
     strlcpy(label, sessions[i].label, sizeof(label));
-    display.setFreeFont(&FreeSans9pt7b);
-    display.setTextColor(C_FG);
-    display.drawString(label, 8, y);
+    useStyle(S_BODY);
     const char *word = stateWord(sessions[i].st);
-    display.setFreeFont(&FreeSansBold9pt7b);
+    while (strlen(label) > 1 && display.textWidth(label) > xw / 2) label[strlen(label) - 1] = 0;
+    display.setTextColor(C_FG);
+    display.drawString(label, x0, y);
+    useStyle(S_HEAD);
     display.setTextColor(stateColor(sessions[i].st));
-    display.drawString(word, W - 8 - display.textWidth(word), y);
-    y += 22;
+    display.drawString(word, x0 + xw - display.textWidth(word), y);
+    y += NP(22);
     shown++;
   }
   if (!shown) {
-    display.setFreeFont(&FreeSans9pt7b);
+    useStyle(S_BODY);
     display.setTextColor(C_DIM);
-    display.drawString("No sessions", 8, y);
+    display.drawString("No sessions", x0, y);
   }
-  display.setFreeFont(NULL);
-  display.setTextFont(1);
+  useFont(nullptr);
   drawFooter();
 }
 
@@ -747,15 +911,6 @@ static constexpr int ALLOW_Y = 204, ALLOW_H = 50, DENY_Y = 262, DENY_H = 34;   /
 static constexpr int SPLIT_X = W / 2 + 2;    // left: allow once · right: allow for this session
 static constexpr uint32_t SESSION_HOLD_MS = 1500;
 static constexpr uint16_t C_SESS = 0x0451;      // teal
-
-// Drawing position for a logical coordinate (the AMOLED draws this screen natively at 1.425x)
-static inline int NP(float v) { return (int)(v * NS + 0.5f); }
-
-void useStyle(const TextStyle &t) {
-  display.setFreeFont(t.font);
-  if (!t.font) display.setTextFont(1);
-  display.setTextSize(t.size);
-}
 
 void drawOneAllow(int x, int w, uint16_t c, float progress, const char *title, const char *sub) {
   const int nx = NP(x), nw = NP(x + w) - nx, ny = NP(ALLOW_Y), nh = NP(ALLOW_H);
@@ -932,11 +1087,19 @@ void handleTouch() {
   }
   if (shown != SCR_PERM) {
     static bool wasTouching = false;
-    static int32_t tapY = 0;
+    static int32_t tapY = 0, tapX = 0, startX = -1;
     allowSince = 0;
-    if (touching) tapY = y;
+    if (touching && !wasTouching) startX = x;
+    if (touching) { tapY = y; tapX = x; }
+    if (wasTouching && !touching && startX >= 0 && abs(tapX - startX) > 40 && shown != SCR_TURN) {
+      showPage(tapX < startX ? +1 : -1);             // swipe left = next page, right = previous
+      wasTouching = false;
+      return;
+    }
     if (wasTouching && !touching) {                  // tap released
-      if (shown == SCR_DETAIL || shown == SCR_CAT) {
+      if (shown == SCR_MP3) {
+        mediaCommand(tapX < W / 3 ? "prev" : tapX < 2 * W / 3 ? "toggle" : "next");
+      } else if (shown == SCR_DETAIL || shown == SCR_CAT) {
         detailAgent = -1;
         dirty = true;
       } else if (shown == SCR_STATUS && agentCount) {
@@ -1082,6 +1245,9 @@ void handleButtons() {
     setBacklight(BL_LEVELS[blIndex]);
     usr1.fired = true;
   }
+  if (!d1 && usr1.down) {                          // report presses so the host log shows the button works
+    Serial.printf("{\"t\":\"btn\",\"ms\":%lu,\"fired\":%d,\"pending\":%d}\n", now - usr1.since, usr1.fired, pendingCount);
+  }
   if (!d1 && usr1.down && !usr1.fired) {
     if (pendingCount && shown == SCR_PERM) {        // released too early: reset the progress bar
       drawAllowButton(0);
@@ -1090,9 +1256,7 @@ void handleButtons() {
       blIndex = (blIndex + 1) % sizeof(BL_LEVELS);
       setBacklight(BL_LEVELS[blIndex]);
     } else if (!pendingCount && agentCount) {       // one-button board: short = next page
-      detailAgent = detailAgent + 1 <= agentCount ? detailAgent + 1 : -1;
-      detailSince = now;
-      dirty = true;
+      showPage(+1);
     }
   }
   usr1.down = d1;
@@ -1112,12 +1276,47 @@ void handleButtons() {
       sendDecide("deny");
       setToast("Denied (USR2)");
     } else if (agentCount) {
-      detailAgent = detailAgent + 1 <= agentCount ? detailAgent + 1 : -1;
-      detailSince = now;
-      dirty = true;
+      showPage(+1);
     }
   }
   usr2.down = d2;
+}
+
+// ── motion: face down = do-not-disturb, picked up = wake ────────────────────
+void handleImu(uint32_t now) {
+  static uint32_t last = 0, downSince = 0, upSince = 0;
+  static float up = 0, lastMag = 1, lastZ = 0;     // up: the sign of z when the screen faces up
+  if (now - last < 150) return;
+  last = now;
+  float ax, ay, az;
+  if (!boardImu(ax, ay, az)) return;
+  if (up == 0) {                                   // first reading: the board starts screen-up on the desk
+    up = az < -0.5f ? -1 : 1;
+    Serial.printf("{\"t\":\"imu\",\"z\":%.2f,\"up\":%d}\n", az, (int)up);
+  }
+  float z = az * up;                               // +1 g screen up, -1 g face down
+  if (!dnd) {
+    downSince = z < -0.75f ? (downSince ? downSince : now) : 0;
+    if (downSince && now - downSince > 1000) {
+      dnd = true;
+      asleep = true;
+      setBacklight(0);
+      Serial.println(F("{\"t\":\"dnd\",\"on\":true}"));
+    }
+  } else {
+    upSince = z > -0.3f ? (upSince ? upSince : now) : 0;
+    if (upSince && now - upSince > 300) {
+      dnd = false;
+      upSince = downSince = 0;
+      Serial.println(F("{\"t\":\"dnd\",\"on\":false}"));
+      wake();
+      dirty = true;
+    }
+  }
+  float mag = sqrtf(ax * ax + ay * ay + az * az);
+  if (!dnd && (asleep || dimmed) && (fabsf(mag - lastMag) > 0.15f || fabsf(z - lastZ) > 0.25f)) wake();   // picked up
+  lastMag = mag;
+  lastZ = z;
 }
 
 // ── battery (voltage estimate, per Seeed's nRF52840 Plus dashboard example) ────
@@ -1172,14 +1371,15 @@ void loop() {
     dirty = true;
   }
   bool linkedMoment = haveHost && !pendingCount && (int32_t)(linkedUntil - now) > 0;
-  Screen want = (!haveHost || linkedMoment) ? SCR_WAIT : pendingCount ? SCR_PERM : unseen() ? SCR_TURN : detailAgent == agentCount ? SCR_CAT : detailAgent >= 0 ? SCR_DETAIL : SCR_STATUS;
+  Screen want = (!haveHost || linkedMoment) ? SCR_WAIT : pendingCount ? SCR_PERM : (unseen() && detailAgent != agentCount + 1) ? SCR_TURN : detailAgent == agentCount ? SCR_CAT : detailAgent == agentCount + 1 ? SCR_MP3 : detailAgent >= 0 ? SCR_DETAIL : SCR_STATUS;
   if (want != shown || dirty) {
     shown = want;
-    useNativeRail(want == SCR_STATUS || want == SCR_PERM);   // drawn natively where the board supports it
+    useNativeRail(true);                                   // every screen is drawn at panel resolution
     if (want == SCR_WAIT) drawWait();
     else if (want == SCR_STATUS) drawRail();
     else if (want == SCR_DETAIL) drawDetail();
     else if (want == SCR_CAT) drawCatMode();
+    else if (want == SCR_MP3) drawMp3();
     else if (want == SCR_TURN) drawTurn();
     else drawPermission();
     dirty = false;
@@ -1204,6 +1404,11 @@ void loop() {
       }
     }
   }
+  if (!asleep && !dimmed && !pendingCount && !unseen() && now - lastActivity > SLEEP_AFTER_MS - 30000) {
+    dimmed = true;                                  // 30 s before sleep: dim
+    setBacklight(min<int>(BL_LEVELS[blIndex], 40));
+  }
+  handleImu(now);
   if (!asleep && !pendingCount && !unseen() && now - lastActivity > SLEEP_AFTER_MS) {
     asleep = true;
     setBacklight(0);
@@ -1221,6 +1426,11 @@ void loop() {
     pulseOn = !pulseOn;
     animateRail(false);
     drawStatusLine();
+  }
+  static uint32_t lastEq = 0;
+  if (shown == SCR_MP3 && !asleep && now - lastEq > 120) {          // spectrum, scrolling title, progress
+    lastEq = now;
+    drawMp3Live();
   }
   static uint32_t lastFrame = 0;
   if (shown == SCR_STATUS && !asleep && now - lastFrame > 80) {   // orbiting dot on working agents' rings

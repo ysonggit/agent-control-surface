@@ -13,6 +13,13 @@ MAX_TEXT = 200
 SESSION_GC = 2 * 3600
 MAX_SESSIONS = 6     # the device shows at most 6; more would overflow its line buffer
 SNAP_LIMIT = 2000    # firmware line buffer is 2100 bytes
+CONFIG = os.path.expanduser("~/.acs/config.json")
+DEFAULT_HIDE = ["claude-desktop"]   # Claude desktop app sessions answer in the app; keep them off the device
+SPOTIFY_READ = """tell application "Spotify"
+  set t to current track
+  return (player state as string) & tab & (name of t) & tab & (artist of t) & tab & (album of t) & tab & (player position as string) & tab & ((duration of t) as string)
+end tell"""
+SPOTIFY_CMD = {"prev": "previous track", "toggle": "playpause", "next": "next track"}
 QUESTION_TTL = 120   # a held question blocks the terminal's own UI, so keep it short (hook timeout: 150 s)
 QUESTION_END = re.compile(r"[?？]\s*[*_`)\]]*\s*$")
 PULSE = "/Applications/Pulse.app/Contents/MacOS/Pulse"
@@ -67,7 +74,10 @@ class Daemon:
         self.rbuf = b""
         self.last_ack = 0.0
         self.obuf, self.writer_on = b"", False
+        self.dnd = False     # device face down: do not route anything to it
         self.usage = {}      # agent -> {"age": s, "win": [{"k", "used", "resets"}]}
+        self.media, self.media_at = {}, 0.0   # Spotify now playing; pos is as of media_at
+        self.media_poke = asyncio.Event()
 
     # ── usage (from Pulse, which reads each provider's own figures) ─────────
     async def poll_usage(self):
@@ -86,9 +96,34 @@ class Daemon:
                 self.changed()
             await asyncio.sleep(USAGE_EVERY)
 
+    # ── Spotify (desktop app, via AppleScript; never launches it) ───────────
+    async def poll_media(self):
+        while True:
+            media = await read_spotify()
+            now = time.time()
+            old = self.media
+            playing = old.get("st") == "playing"
+            expected = old.get("pos", 0) + (now - self.media_at if playing else 0)
+            same = bool(media) == bool(old) and all(media.get(k) == old.get(k) for k in ("st", "title", "artist", "album", "dur"))
+            if not same or abs(media.get("pos", 0) - expected) > 2:   # the position is only sent when it jumps
+                self.media, self.media_at = media, now
+                self.changed()
+            try:
+                await asyncio.wait_for(self.media_poke.wait(), 1.0)
+            except asyncio.TimeoutError:
+                pass
+            self.media_poke.clear()
+
+    async def media_command(self, cmd):
+        if cmd not in SPOTIFY_CMD or not await spotify_running():
+            return
+        await run(["osascript", "-e", f'tell application "Spotify" to {SPOTIFY_CMD[cmd]}'])
+        log("spotify", cmd)
+        self.media_poke.set()
+
     # ── device ──────────────────────────────────────────────────────────────
     def device_live(self):
-        return self.fd is not None and time.time() - self.last_ack < LIVE_WINDOW
+        return self.fd is not None and not self.dnd and time.time() - self.last_ack < LIVE_WINDOW
 
     def open_serial(self):
         paths = [self.serial_arg] if self.serial_arg != "auto" else sorted(glob.glob("/dev/cu.usbmodem*"))
@@ -126,7 +161,7 @@ class Daemon:
         """Queue a line for the device; a full port is drained when writable instead of dropping state."""
         if self.fd is None:
             return
-        line = (json.dumps(obj, separators=(",", ":")) + "\n").encode()
+        line = (json.dumps(obj, separators=(",", ":"), ensure_ascii=False) + "\n").encode()
         if len(self.obuf) > 32768:      # device not reading: keep only the newest message
             self.obuf = b""
         self.obuf += line
@@ -176,9 +211,23 @@ class Daemon:
         elif t == "hello":
             log("device hello", msg)
             self.last_ack = time.time()
+            self.dnd = bool(msg.get("dnd"))
             self.send_snap()
         elif t == "decide":
             self.decide(msg.get("id"), msg.get("d"), msg.get("opt"))
+        elif t == "dnd":                              # face down: hand everything waiting back to the keyboard
+            self.dnd = bool(msg.get("on"))
+            log("device do-not-disturb", "on" if self.dnd else "off")
+            if self.dnd:
+                for p in list(self.pending.values()):
+                    self.resolve(p, {})
+            self.changed()
+        elif t == "imu":
+            log("device imu", msg)
+        elif t == "btn":
+            log("device button", msg)
+        elif t == "media":
+            asyncio.ensure_future(self.media_command(msg.get("cmd")))
 
     def send_snap(self):
         now = time.time()
@@ -190,11 +239,11 @@ class Daemon:
                                            "created", "sess", "kind", "opts", "qpos")}
                         for p in list(self.pending.values())[:4]],
             "usage": self.usage,
+            "media": self.media,
         }
-        line = json.dumps(snap, separators=(",", ":"))
-        while len(line) > SNAP_LIMIT and snap["sessions"]:   # never let the device drop a whole snapshot
+        size = lambda: len(json.dumps(snap, separators=(",", ":"), ensure_ascii=False).encode())
+        while size() > SNAP_LIMIT and snap["sessions"]:     # never let the device drop a whole snapshot
             snap["sessions"].pop()
-            line = json.dumps(snap, separators=(",", ":"))
         self.write(snap)
 
     def changed(self):
@@ -330,6 +379,12 @@ class Daemon:
         except (ValueError, KeyError, ConnectionError):
             writer.close()
             return
+        if msg.get("source", "") in hidden_sources():
+            if msg.get("wait") or ev.get("hook_event_name") == "PermissionRequest":
+                writer.write(b"{}\n")    # the agent's own dialog handles it
+                await writer.drain()
+            writer.close()
+            return
         s = self.session_for(agent, ev)
         self.settle_elsewhere(s, ev)
         self.reduce(s, ev)
@@ -440,8 +495,58 @@ class Daemon:
         log("listening", sock_path, "serial", self.serial_arg)
         self.open_serial()
         asyncio.ensure_future(self.poll_usage())
+        asyncio.ensure_future(self.poll_media())
         async with server:
             await self.housekeeping()
+
+
+async def run(argv, timeout=5):
+    try:
+        p = await asyncio.create_subprocess_exec(*argv, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL)
+        out, _ = await asyncio.wait_for(p.communicate(), timeout)
+        return p.returncode, out.decode("utf-8", "replace")
+    except (OSError, asyncio.TimeoutError):
+        return -1, ""
+
+
+async def spotify_running():
+    return (await run(["pgrep", "-x", "Spotify"]))[0] == 0
+
+
+def utf8_text(s, max_bytes):
+    """Trim to the device buffer at a character boundary (the device has a CJK font; the XIAO filters to ASCII)."""
+    t = "".join(c for c in s if ord(c) >= 32).strip()
+    while len(t.encode()) > max_bytes:
+        t = t[:-1]
+    return t
+
+
+async def read_spotify():
+    """{"app", "st", "title", "artist", "pos", "dur"} from the Spotify desktop app, or {} when it is not running."""
+    if not await spotify_running():
+        return {}
+    rc, out = await run(["osascript", "-e", SPOTIFY_READ])
+    parts = out.rstrip("\n").split("\t")
+    if rc != 0 or len(parts) != 6:
+        return {}
+    st, title, artist, album, pos, dur = parts
+    try:
+        pos_s = int(float(pos.replace(",", ".")))           # decimal comma in some locales
+        dur_s = int(dur) // 1000
+    except ValueError:
+        return {}
+    if album.strip() and (title.startswith(album.strip()) or album.startswith(title.strip())):
+        album = ""                                       # singles: the album repeats the title, so leave it out
+    return {"app": "Spotify", "st": st, "title": utf8_text(title, 90) or "Now playing",
+            "artist": utf8_text(artist, 60), "album": utf8_text(album, 60), "pos": pos_s, "dur": dur_s}
+
+
+def hidden_sources():
+    """Sources kept off the device, from ~/.acs/config.json ("hide_sources"); read on every event so edits apply at once."""
+    try:
+        return set(json.load(open(CONFIG)).get("hide_sources", DEFAULT_HIDE))
+    except (OSError, ValueError):
+        return set(DEFAULT_HIDE)
 
 
 def call_key(ev):

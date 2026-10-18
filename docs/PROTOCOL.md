@@ -61,6 +61,14 @@ The host (daemon `acsd`) is the only authority. The device renders the latest sn
 | `ack` | After rendering each `snap`. The host treats the device as **live** only while an `ack` arrived in the last 12 s. |
 | `decide` | Permission: `d` is `allow` · `allow_session` · `deny` · `deny_stop`. `yesno`: `yes` · `no` · `release`. `ask`: `opt` with `"opt": <index>`, or `release`. `release` hands the question back to the terminal. Must name a pending `id`. `allow_session` adds an in-memory Claude rule for this exact Bash command (`destination: "session"`, never written to a settings file). |
 
+## Spotify, motion and diagnostics
+
+- Snapshot field `media`: `{"app":"Spotify","st":"playing","title":"晴天","artist":"周杰伦","album":"叶惠美","pos":63,"dur":269}`, or `{}` when the Spotify desktop app is not running. Text is UTF-8 (sent without `\u` escapes); `pos` is only resent when it jumps, the device extrapolates in between. `album` is empty when it repeats the title.
+- Device → host `{"t":"media","cmd":"prev|toggle|next"}`: the host runs the matching AppleScript command.
+- Device → host `{"t":"dnd","on":true|false}` (also `"dnd"` in `hello`): face down. While on, the device is not live for routing and anything pending is handed back to the agent's own UI.
+- Device → host `{"t":"imu",...}` and `{"t":"btn",...}`: logged by the host for diagnostics only.
+- Hooks report `"source"` (Claude's `CLAUDE_CODE_ENTRYPOINT`, e.g. `cli`, `claude-desktop`; `codex` for Codex). Sources listed in `~/.acs/config.json` `hide_sources` (default `["claude-desktop"]`) never reach the device.
+
 ## Input mapping (firmware)
 
 | Input | Action |

@@ -21,7 +21,8 @@ def main():
         s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         s.settimeout(0.3)
         s.connect(SOCK)
-        s.sendall((json.dumps({"agent": agent, "event": event, "wait": blocking}) + "\n").encode())
+        source = os.environ.get("CLAUDE_CODE_ENTRYPOINT", "") if agent == "claude" else agent   # cli, claude-desktop, ...
+        s.sendall((json.dumps({"agent": agent, "event": event, "wait": blocking, "source": source}) + "\n").encode())
         if not blocking:
             return
         s.settimeout(None)  # Claude Code kills us if the keyboard answers first
